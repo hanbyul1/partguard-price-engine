@@ -1,39 +1,146 @@
 const express = require("express");
+const fetch = require("node-fetch");
 
 const app = express();
 
-const fakeEbay = {
-    "123": [45, 50, 55],
-    "ABC123": [80, 90, 100]
-};
+const CLIENT_ID = process.env.EBAY_CLIENT_ID;
+const CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
 
+let cachedToken = null;
+let tokenExpiry = 0;
+
+// =========================
+// 🔐 GET EBAY TOKEN
+// =========================
+async function getToken() {
+    const now = Date.now();
+
+    if (cachedToken && now < tokenExpiry) {
+        return cachedToken;
+    }
+
+    const credentials = Buffer.from(
+        `${CLIENT_ID}:${CLIENT_SECRET}`
+    ).toString("base64");
+
+    const response = await fetch(
+        "https://api.ebay.com/identity/v1/oauth2/token",
+        {
+            method: "POST",
+            headers: {
+                Authorization: `Basic ${credentials}`,
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: "grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope"
+        }
+    );
+
+    const data = await response.json();
+
+    if (!data.access_token) {
+        console.error("❌ TOKEN ERROR:", data);
+        throw new Error("Failed to get eBay token");
+    }
+
+    cachedToken = data.access_token;
+    tokenExpiry = now + (data.expires_in - 60) * 1000;
+
+    return cachedToken;
+}
+
+// =========================
+// 🧪 HEALTH CHECK
+// =========================
 app.get("/ping", (req, res) => {
     res.send("server alive");
 });
 
-app.get("/price", (req, res) => {
+// =========================
+// 🔍 SEARCH PART
+// =========================
+app.get("/search", async (req, res) => {
     const part = req.query.part;
 
-    const prices = fakeEbay[part];
-
-    if (!prices) {
-        return res.json({
-            part,
-            error: "No data"
-        });
+    if (!part) {
+        return res.status(400).json({ error: "Missing part" });
     }
 
-    const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
+    try {
+        const token = await getToken();
 
-    res.json({
-        part,
-        avgPrice: avg,
-        samples: prices
-    });
+        const response = await fetch(
+            `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(part)}&filter=buyingOptions:{FIXED_PRICE},conditionIds:{1000}`,
+            {
+                headers: {
+                    Authorization: `Bearer ${token}`
+                }
+            }
+        );
+
+        const data = await response.json();
+
+        const items = data.itemSummaries || [];
+
+        if (items.length === 0) {
+            return res.json({
+                price: 0,
+                url: null,
+                imageURL: null
+            });
+        }
+
+        // 🔥 median price
+        const prices = items
+            .map(i => parseFloat(i.price?.value))
+            .filter(v => !isNaN(v));
+
+        const sorted = prices.sort((a, b) => a - b);
+
+        const median =
+            sorted.length % 2 === 0
+                ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+                : sorted[Math.floor(sorted.length / 2)];
+
+        // 🔥 pick best image (first valid)
+        let imageURL = null;
+
+        for (const item of items) {
+            if (item.image?.imageUrl?.includes("ebayimg.com")) {
+                imageURL = item.image.imageUrl;
+                break;
+            }
+
+            if (item.thumbnailImages) {
+                for (const t of item.thumbnailImages) {
+                    if (t.imageUrl?.includes("ebayimg.com")) {
+                        imageURL = t.imageUrl;
+                        break;
+                    }
+                }
+            }
+
+            if (imageURL) break;
+        }
+
+        const first = items[0];
+
+        res.json({
+            price: median || 0,
+            url: first.itemWebUrl || null,
+            imageURL
+        });
+
+    } catch (err) {
+        console.error("❌ SEARCH ERROR:", err);
+        res.status(500).json({ error: "Server error" });
+    }
 });
 
+// =========================
+// 🚀 START SERVER
+// =========================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
