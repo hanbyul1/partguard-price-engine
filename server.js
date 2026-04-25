@@ -20,10 +20,10 @@ let cachedToken = null;
 let tokenExpiry = 0;
 
 // =========================
-// 📦 RESULT CACHE (VERY IMPORTANT)
+// 📦 RESULT CACHE
 // =========================
 const resultCache = new Map();
-const CACHE_TTL = 1000 * 60 * 10; // 10 minutes
+const CACHE_TTL = 1000 * 60 * 10;
 
 // =========================
 // 🔐 GET EBAY TOKEN
@@ -32,8 +32,11 @@ async function getToken() {
     const now = Date.now();
 
     if (cachedToken && now < tokenExpiry) {
+        console.log("🔁 Using cached token");
         return cachedToken;
     }
+
+    console.log("🆕 Fetching new eBay token");
 
     const credentials = Buffer.from(
         `${CLIENT_ID}:${CLIENT_SECRET}`
@@ -51,17 +54,19 @@ async function getToken() {
         }
     );
 
+    const text = await ebayResponse.text();
+    console.log("🔐 TOKEN RAW RESPONSE:", text);
+
     if (!ebayResponse.ok) {
-        const text = await ebayResponse.text();
         console.error("❌ TOKEN HTTP ERROR:", ebayResponse.status, text);
         throw new Error("Token request failed");
     }
 
-    const data = await ebayResponse.json();
+    const data = JSON.parse(text);
 
     if (!data.access_token) {
         console.error("❌ TOKEN ERROR:", data);
-        throw new Error("Failed to get eBay token");
+        throw new Error("No access token");
     }
 
     cachedToken = data.access_token;
@@ -74,6 +79,7 @@ async function getToken() {
 // 🧪 HEALTH CHECK
 // =========================
 app.get("/ping", (req, res) => {
+    console.log("🏓 /ping hit");
     res.send("server alive");
 });
 
@@ -81,31 +87,38 @@ app.get("/ping", (req, res) => {
 // 🔍 SEARCH PART
 // =========================
 app.get("/search", async (req, res) => {
+    const startTime = Date.now();
     const part = req.query.part;
+
+    console.log("\n=========================");
+    console.log("🔍 SEARCH REQUEST:", part);
 
     if (!part) {
         return res.status(400).json({ error: "Missing part" });
     }
 
     // =========================
-    // 🔥 CACHE HIT (huge win)
+    // CACHE
     // =========================
     const cached = resultCache.get(part);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        console.log("⚡ CACHE HIT:", part);
         return res.json(cached.data);
     }
 
     try {
         const token = await getToken();
 
-        // =========================
-        // 🔥 TIMEOUT PROTECTION (3s)
-        // =========================
+        console.log("📡 Calling eBay API...");
+
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 3000);
+        const timeout = setTimeout(() => {
+            console.log("⏱️ TIMEOUT triggered");
+            controller.abort();
+        }, 3000);
 
         const ebayResponse = await fetch(
-            `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(part)}&filter=buyingOptions:{FIXED_PRICE},conditionIds:{1000}`,
+            `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(part)}`,
             {
                 headers: {
                     Authorization: `Bearer ${token}`
@@ -116,13 +129,15 @@ app.get("/search", async (req, res) => {
 
         clearTimeout(timeout);
 
-        // =========================
-        // ❗ HANDLE HTTP ERRORS
-        // =========================
-        if (!ebayResponse.ok) {
-            const text = await ebayResponse.text();
-            console.error("❌ EBAY HTTP ERROR:", ebayResponse.status, text);
+        console.log("📥 EBAY STATUS:", ebayResponse.status);
+        console.log("📥 EBAY HEADERS:", Object.fromEntries(ebayResponse.headers));
 
+        const rawText = await ebayResponse.text();
+
+        console.log("🔴 EBAY RAW RESPONSE:", rawText);
+
+        if (!ebayResponse.ok) {
+            console.error("❌ EBAY HTTP ERROR:", ebayResponse.status);
             return res.json({
                 price: 0,
                 url: null,
@@ -130,9 +145,17 @@ app.get("/search", async (req, res) => {
             });
         }
 
-        const data = await ebayResponse.json();
+        let data;
+        try {
+            data = JSON.parse(rawText);
+        } catch {
+            console.error("❌ JSON PARSE ERROR");
+            throw new Error("Invalid JSON from eBay");
+        }
 
         const items = data.itemSummaries || [];
+
+        console.log("📦 ITEMS FOUND:", items.length);
 
         if (items.length === 0) {
             return res.json({
@@ -143,7 +166,7 @@ app.get("/search", async (req, res) => {
         }
 
         // =========================
-        // 🔥 MEDIAN PRICE
+        // PRICE
         // =========================
         const prices = items
             .map(i => parseFloat(i.price?.value))
@@ -153,7 +176,6 @@ app.get("/search", async (req, res) => {
 
         if (prices.length > 0) {
             const sorted = prices.sort((a, b) => a - b);
-
             median =
                 sorted.length % 2 === 0
                     ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
@@ -161,7 +183,7 @@ app.get("/search", async (req, res) => {
         }
 
         // =========================
-        // 🖼 IMAGE SELECTION
+        // IMAGE
         // =========================
         let imageURL = null;
 
@@ -170,17 +192,6 @@ app.get("/search", async (req, res) => {
                 imageURL = item.image.imageUrl;
                 break;
             }
-
-            if (item.thumbnailImages) {
-                for (const t of item.thumbnailImages) {
-                    if (t.imageUrl?.includes("ebayimg.com")) {
-                        imageURL = t.imageUrl;
-                        break;
-                    }
-                }
-            }
-
-            if (imageURL) break;
         }
 
         const first = items[0];
@@ -191,13 +202,13 @@ app.get("/search", async (req, res) => {
             imageURL
         };
 
-        // =========================
-        // 💾 STORE CACHE
-        // =========================
         resultCache.set(part, {
             data: result,
             timestamp: Date.now()
         });
+
+        console.log("✅ SUCCESS:", result);
+        console.log("⏱️ TOTAL TIME:", Date.now() - startTime, "ms");
 
         res.json(result);
 
