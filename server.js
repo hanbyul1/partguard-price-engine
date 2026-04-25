@@ -1,11 +1,21 @@
 const express = require("express");
-const fetch = require("node-fetch");
 
 const app = express();
 
+// =========================
+// 🔐 ENV VARIABLES
+// =========================
 const CLIENT_ID = process.env.EBAY_CLIENT_ID;
 const CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
 
+if (!CLIENT_ID || !CLIENT_SECRET) {
+    console.error("❌ Missing eBay credentials in environment variables");
+    process.exit(1);
+}
+
+// =========================
+// 🔐 TOKEN CACHE
+// =========================
 let cachedToken = null;
 let tokenExpiry = 0;
 
@@ -23,7 +33,7 @@ async function getToken() {
         `${CLIENT_ID}:${CLIENT_SECRET}`
     ).toString("base64");
 
-    const response = await fetch(
+    const ebayResponse = await fetch(
         "https://api.ebay.com/identity/v1/oauth2/token",
         {
             method: "POST",
@@ -35,7 +45,7 @@ async function getToken() {
         }
     );
 
-    const data = await response.json();
+    const data = await ebayResponse.json();
 
     if (!data.access_token) {
         console.error("❌ TOKEN ERROR:", data);
@@ -68,7 +78,7 @@ app.get("/search", async (req, res) => {
     try {
         const token = await getToken();
 
-        const response = await fetch(
+        const ebayResponse = await fetch(
             `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(part)}&filter=buyingOptions:{FIXED_PRICE},conditionIds:{1000}`,
             {
                 headers: {
@@ -77,7 +87,7 @@ app.get("/search", async (req, res) => {
             }
         );
 
-        const data = await response.json();
+        const data = await ebayResponse.json();
 
         const items = data.itemSummaries || [];
 
@@ -89,19 +99,27 @@ app.get("/search", async (req, res) => {
             });
         }
 
-        // 🔥 median price
+        // =========================
+        // 🔥 MEDIAN PRICE (SAFE)
+        // =========================
         const prices = items
             .map(i => parseFloat(i.price?.value))
             .filter(v => !isNaN(v));
 
-        const sorted = prices.sort((a, b) => a - b);
+        let median = 0;
 
-        const median =
-            sorted.length % 2 === 0
-                ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
-                : sorted[Math.floor(sorted.length / 2)];
+        if (prices.length > 0) {
+            const sorted = prices.sort((a, b) => a - b);
 
-        // 🔥 pick best image (first valid)
+            median =
+                sorted.length % 2 === 0
+                    ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+                    : sorted[Math.floor(sorted.length / 2)];
+        }
+
+        // =========================
+        // 🖼 IMAGE SELECTION
+        // =========================
         let imageURL = null;
 
         for (const item of items) {
@@ -122,11 +140,14 @@ app.get("/search", async (req, res) => {
             if (imageURL) break;
         }
 
+        // =========================
+        // 🔗 ITEM URL
+        // =========================
         const first = items[0];
 
         res.json({
-            price: median || 0,
-            url: first.itemWebUrl || null,
+            price: median,
+            url: first?.itemWebUrl || null,
             imageURL
         });
 
@@ -142,5 +163,5 @@ app.get("/search", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
