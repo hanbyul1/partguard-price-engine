@@ -20,6 +20,12 @@ let cachedToken = null;
 let tokenExpiry = 0;
 
 // =========================
+// 📦 RESULT CACHE (VERY IMPORTANT)
+// =========================
+const resultCache = new Map();
+const CACHE_TTL = 1000 * 60 * 10; // 10 minutes
+
+// =========================
 // 🔐 GET EBAY TOKEN
 // =========================
 async function getToken() {
@@ -44,6 +50,12 @@ async function getToken() {
             body: "grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope"
         }
     );
+
+    if (!ebayResponse.ok) {
+        const text = await ebayResponse.text();
+        console.error("❌ TOKEN HTTP ERROR:", ebayResponse.status, text);
+        throw new Error("Token request failed");
+    }
 
     const data = await ebayResponse.json();
 
@@ -75,17 +87,48 @@ app.get("/search", async (req, res) => {
         return res.status(400).json({ error: "Missing part" });
     }
 
+    // =========================
+    // 🔥 CACHE HIT (huge win)
+    // =========================
+    const cached = resultCache.get(part);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        return res.json(cached.data);
+    }
+
     try {
         const token = await getToken();
+
+        // =========================
+        // 🔥 TIMEOUT PROTECTION (3s)
+        // =========================
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
 
         const ebayResponse = await fetch(
             `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(part)}&filter=buyingOptions:{FIXED_PRICE},conditionIds:{1000}`,
             {
                 headers: {
                     Authorization: `Bearer ${token}`
-                }
+                },
+                signal: controller.signal
             }
         );
+
+        clearTimeout(timeout);
+
+        // =========================
+        // ❗ HANDLE HTTP ERRORS
+        // =========================
+        if (!ebayResponse.ok) {
+            const text = await ebayResponse.text();
+            console.error("❌ EBAY HTTP ERROR:", ebayResponse.status, text);
+
+            return res.json({
+                price: 0,
+                url: null,
+                imageURL: null
+            });
+        }
 
         const data = await ebayResponse.json();
 
@@ -100,7 +143,7 @@ app.get("/search", async (req, res) => {
         }
 
         // =========================
-        // 🔥 MEDIAN PRICE (SAFE)
+        // 🔥 MEDIAN PRICE
         // =========================
         const prices = items
             .map(i => parseFloat(i.price?.value))
@@ -140,20 +183,32 @@ app.get("/search", async (req, res) => {
             if (imageURL) break;
         }
 
-        // =========================
-        // 🔗 ITEM URL
-        // =========================
         const first = items[0];
 
-        res.json({
+        const result = {
             price: median,
             url: first?.itemWebUrl || null,
             imageURL
+        };
+
+        // =========================
+        // 💾 STORE CACHE
+        // =========================
+        resultCache.set(part, {
+            data: result,
+            timestamp: Date.now()
         });
+
+        res.json(result);
 
     } catch (err) {
         console.error("❌ SEARCH ERROR:", err);
-        res.status(500).json({ error: "Server error" });
+
+        res.json({
+            price: 0,
+            url: null,
+            imageURL: null
+        });
     }
 });
 
