@@ -8,11 +8,17 @@ const app = express();
 // =========================
 const CLIENT_ID = process.env.EBAY_CLIENT_ID;
 const CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
+const EBAY_ENV = process.env.EBAY_ENV === "sandbox" ? "sandbox" : "production";
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
     console.error("❌ Missing eBay credentials");
     process.exit(1);
 }
+
+const EBAY_BASE_URL =
+    EBAY_ENV === "sandbox"
+        ? "https://api.sandbox.ebay.com"
+        : "https://api.ebay.com";
 
 // =========================
 // 🔐 TOKEN CACHE
@@ -30,15 +36,19 @@ const CACHE_TTL = 1000 * 60 * 10;
 // 🔁 RETRY HELPER
 // =========================
 async function retry(fn, retries = 3) {
+    let lastErr;
     for (let i = 0; i < retries; i++) {
         try {
             return await fn();
         } catch (err) {
+            lastErr = err;
             console.log(`⚠️ Retry ${i + 1}`);
-            if (i === retries - 1) throw err;
-            await new Promise(r => setTimeout(r, 800));
+            if (i < retries - 1) {
+                await new Promise(r => setTimeout(r, 800));
+            }
         }
     }
+    throw lastErr;
 }
 
 // =========================
@@ -54,22 +64,21 @@ async function getToken() {
 
     console.log("🆕 Fetching new eBay token");
 
-    const credentials = Buffer.from(
-        `${CLIENT_ID}:${CLIENT_SECRET}`
-    ).toString("base64");
+    const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
+
+    const body = new URLSearchParams({
+        grant_type: "client_credentials",
+        scope: "https://api.ebay.com/oauth/api_scope"
+    }).toString();
 
     const response = await retry(() =>
-        axios.post(
-            "https://api.ebay.com/identity/v1/oauth2/token",
-            "grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope",
-            {
-                headers: {
-                    Authorization: `Basic ${credentials}`,
-                    "Content-Type": "application/x-www-form-urlencoded"
-                },
-                timeout: 5000
-            }
-        )
+        axios.post(`${EBAY_BASE_URL}/identity/v1/oauth2/token`, body, {
+            headers: {
+                Authorization: `Basic ${credentials}`,
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            timeout: 5000
+        })
     );
 
     const data = response.data;
@@ -92,19 +101,16 @@ async function ebaySearch(query) {
     const token = await getToken();
 
     const response = await retry(() =>
-        axios.get(
-            "https://api.ebay.com/buy/browse/v1/item_summary/search",
-            {
-                headers: {
-                    Authorization: `Bearer ${token}`
-                },
-                params: {
-                    q: query,
-                    limit: 10
-                },
-                timeout: 5000
-            }
-        )
+        axios.get(`${EBAY_BASE_URL}/buy/browse/v1/item_summary/search`, {
+            headers: {
+                Authorization: `Bearer ${token}`
+            },
+            params: {
+                q: query,
+                limit: 10
+            },
+            timeout: 5000
+        })
     );
 
     const data = response.data;
@@ -113,8 +119,8 @@ async function ebaySearch(query) {
     if (items.length === 0) return null;
 
     const prices = items
-        .map(i => parseFloat(i.price?.value))
-        .filter(v => !isNaN(v));
+        .map(i => Number(i.price?.value))
+        .filter(v => Number.isFinite(v));
 
     if (prices.length === 0) return null;
 
@@ -125,13 +131,8 @@ async function ebaySearch(query) {
             ? (prices[prices.length / 2 - 1] + prices[prices.length / 2]) / 2
             : prices[Math.floor(prices.length / 2)];
 
-    let imageURL = null;
-    for (const item of items) {
-        if (item.image?.imageUrl?.includes("ebayimg.com")) {
-            imageURL = item.image.imageUrl;
-            break;
-        }
-    }
+    const imageURL =
+        items.find(item => item.image?.imageUrl?.includes("ebayimg.com"))?.image?.imageUrl || null;
 
     return {
         price: median,
@@ -161,9 +162,6 @@ app.get("/search", async (req, res) => {
         return res.status(400).json({ error: "Missing part" });
     }
 
-    // =========================
-    // CACHE
-    // =========================
     const cached = resultCache.get(part);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
         console.log("⚡ CACHE HIT");
@@ -171,9 +169,10 @@ app.get("/search", async (req, res) => {
     }
 
     try {
-        let result =
-            await ebaySearch(`${part} GM`) ||
-            await ebaySearch(part);
+        let result = await ebaySearch(`${part} GM`);
+        if (!result) {
+            result = await ebaySearch(part);
+        }
 
         if (!result) {
             result = {
@@ -192,9 +191,9 @@ app.get("/search", async (req, res) => {
         console.log("⏱️ TIME:", Date.now() - startTime, "ms");
 
         res.json(result);
-
     } catch (err) {
-        console.error("❌ ERROR:", err.message);
+        const ebayMsg = err.response?.data || err.message;
+        console.error("❌ ERROR:", ebayMsg);
 
         res.json({
             price: null,
