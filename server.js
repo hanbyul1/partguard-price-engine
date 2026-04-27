@@ -1,4 +1,5 @@
 const express = require("express");
+const axios = require("axios");
 
 const app = express();
 
@@ -9,7 +10,7 @@ const CLIENT_ID = process.env.EBAY_CLIENT_ID;
 const CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
-    console.error("❌ Missing eBay credentials in environment variables");
+    console.error("❌ Missing eBay credentials");
     process.exit(1);
 }
 
@@ -24,6 +25,21 @@ let tokenExpiry = 0;
 // =========================
 const resultCache = new Map();
 const CACHE_TTL = 1000 * 60 * 10;
+
+// =========================
+// 🔁 RETRY HELPER
+// =========================
+async function retry(fn, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            return await fn();
+        } catch (err) {
+            console.log(`⚠️ Retry ${i + 1}`);
+            if (i === retries - 1) throw err;
+            await new Promise(r => setTimeout(r, 800));
+        }
+    }
+}
 
 // =========================
 // 🔐 GET EBAY TOKEN
@@ -42,27 +58,21 @@ async function getToken() {
         `${CLIENT_ID}:${CLIENT_SECRET}`
     ).toString("base64");
 
-    const ebayResponse = await fetch(
-        "https://api.ebay.com/identity/v1/oauth2/token",
-        {
-            method: "POST",
-            headers: {
-                Authorization: `Basic ${credentials}`,
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            body: "grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope"
-        }
+    const response = await retry(() =>
+        axios.post(
+            "https://api.ebay.com/identity/v1/oauth2/token",
+            "grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope",
+            {
+                headers: {
+                    Authorization: `Basic ${credentials}`,
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                timeout: 5000
+            }
+        )
     );
 
-    const text = await ebayResponse.text();
-    console.log("🔐 TOKEN RAW RESPONSE:", text);
-
-    if (!ebayResponse.ok) {
-        console.error("❌ TOKEN HTTP ERROR:", ebayResponse.status, text);
-        throw new Error("Token request failed");
-    }
-
-    const data = JSON.parse(text);
+    const data = response.data;
 
     if (!data.access_token) {
         console.error("❌ TOKEN ERROR:", data);
@@ -76,10 +86,64 @@ async function getToken() {
 }
 
 // =========================
+// 🔍 EBAY SEARCH
+// =========================
+async function ebaySearch(query) {
+    const token = await getToken();
+
+    const response = await retry(() =>
+        axios.get(
+            "https://api.ebay.com/buy/browse/v1/item_summary/search",
+            {
+                headers: {
+                    Authorization: `Bearer ${token}`
+                },
+                params: {
+                    q: query,
+                    limit: 10
+                },
+                timeout: 5000
+            }
+        )
+    );
+
+    const data = response.data;
+    const items = data.itemSummaries || [];
+
+    if (items.length === 0) return null;
+
+    const prices = items
+        .map(i => parseFloat(i.price?.value))
+        .filter(v => !isNaN(v));
+
+    if (prices.length === 0) return null;
+
+    prices.sort((a, b) => a - b);
+
+    const median =
+        prices.length % 2 === 0
+            ? (prices[prices.length / 2 - 1] + prices[prices.length / 2]) / 2
+            : prices[Math.floor(prices.length / 2)];
+
+    let imageURL = null;
+    for (const item of items) {
+        if (item.image?.imageUrl?.includes("ebayimg.com")) {
+            imageURL = item.image.imageUrl;
+            break;
+        }
+    }
+
+    return {
+        price: median,
+        url: items[0]?.itemWebUrl || null,
+        imageURL
+    };
+}
+
+// =========================
 // 🧪 HEALTH CHECK
 // =========================
 app.get("/ping", (req, res) => {
-    console.log("🏓 /ping hit");
     res.send("server alive");
 });
 
@@ -91,7 +155,7 @@ app.get("/search", async (req, res) => {
     const part = req.query.part;
 
     console.log("\n=========================");
-    console.log("🔍 SEARCH REQUEST:", part);
+    console.log("🔍 SEARCH:", part);
 
     if (!part) {
         return res.status(400).json({ error: "Missing part" });
@@ -102,121 +166,38 @@ app.get("/search", async (req, res) => {
     // =========================
     const cached = resultCache.get(part);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-        console.log("⚡ CACHE HIT:", part);
+        console.log("⚡ CACHE HIT");
         return res.json(cached.data);
     }
 
     try {
-        const token = await getToken();
+        let result =
+            await ebaySearch(`${part} GM`) ||
+            await ebaySearch(part);
 
-        console.log("📡 Calling eBay API...");
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => {
-            console.log("⏱️ TIMEOUT triggered");
-            controller.abort();
-        }, 3000);
-
-        const ebayResponse = await fetch(
-            `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(part)}`,
-            {
-                headers: {
-                    Authorization: `Bearer ${token}`
-                },
-                signal: controller.signal
-            }
-        );
-
-        clearTimeout(timeout);
-
-        console.log("📥 EBAY STATUS:", ebayResponse.status);
-        console.log("📥 EBAY HEADERS:", Object.fromEntries(ebayResponse.headers));
-
-        const rawText = await ebayResponse.text();
-
-        console.log("🔴 EBAY RAW RESPONSE:", rawText);
-
-        if (!ebayResponse.ok) {
-            console.error("❌ EBAY HTTP ERROR:", ebayResponse.status);
-            return res.json({
-                price: 0,
+        if (!result) {
+            result = {
+                price: null,
                 url: null,
                 imageURL: null
-            });
+            };
         }
-
-        let data;
-        try {
-            data = JSON.parse(rawText);
-        } catch {
-            console.error("❌ JSON PARSE ERROR");
-            throw new Error("Invalid JSON from eBay");
-        }
-
-        const items = data.itemSummaries || [];
-
-        console.log("📦 ITEMS FOUND:", items.length);
-
-        if (items.length === 0) {
-            return res.json({
-                price: 0,
-                url: null,
-                imageURL: null
-            });
-        }
-
-        // =========================
-        // PRICE
-        // =========================
-        const prices = items
-            .map(i => parseFloat(i.price?.value))
-            .filter(v => !isNaN(v));
-
-        let median = 0;
-
-        if (prices.length > 0) {
-            const sorted = prices.sort((a, b) => a - b);
-            median =
-                sorted.length % 2 === 0
-                    ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
-                    : sorted[Math.floor(sorted.length / 2)];
-        }
-
-        // =========================
-        // IMAGE
-        // =========================
-        let imageURL = null;
-
-        for (const item of items) {
-            if (item.image?.imageUrl?.includes("ebayimg.com")) {
-                imageURL = item.image.imageUrl;
-                break;
-            }
-        }
-
-        const first = items[0];
-
-        const result = {
-            price: median,
-            url: first?.itemWebUrl || null,
-            imageURL
-        };
 
         resultCache.set(part, {
             data: result,
             timestamp: Date.now()
         });
 
-        console.log("✅ SUCCESS:", result);
-        console.log("⏱️ TOTAL TIME:", Date.now() - startTime, "ms");
+        console.log("✅ RESULT:", result);
+        console.log("⏱️ TIME:", Date.now() - startTime, "ms");
 
         res.json(result);
 
     } catch (err) {
-        console.error("❌ SEARCH ERROR:", err);
+        console.error("❌ ERROR:", err.message);
 
         res.json({
-            price: 0,
+            price: null,
             url: null,
             imageURL: null
         });
