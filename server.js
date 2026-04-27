@@ -37,17 +37,20 @@ const CACHE_TTL = 1000 * 60 * 10;
 // =========================
 async function retry(fn, retries = 3) {
     let lastErr;
+
     for (let i = 0; i < retries; i++) {
         try {
             return await fn();
         } catch (err) {
             lastErr = err;
-            console.log(`⚠️ Retry ${i + 1}`);
+            console.log(`⚠️ Retry ${i + 1}:`, err.message);
+
             if (i < retries - 1) {
-                await new Promise(r => setTimeout(r, 800));
+                await new Promise(r => setTimeout(r, 800 * (i + 1)));
             }
         }
     }
+
     throw lastErr;
 }
 
@@ -77,7 +80,7 @@ async function getToken() {
                 Authorization: `Basic ${credentials}`,
                 "Content-Type": "application/x-www-form-urlencoded"
             },
-            timeout: 5000
+            timeout: 8000
         })
     );
 
@@ -95,10 +98,92 @@ async function getToken() {
 }
 
 // =========================
+// 🧹 HELPERS
+// =========================
+function cleanText(value) {
+    return String(value || "")
+        .replace(/[^\w\s\-&/]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function normalizePart(part) {
+    return String(part || "")
+        .trim()
+        .replace(/\s+/g, "")
+        .toUpperCase();
+}
+
+function buildQueries(part, desc) {
+    const p = normalizePart(part);
+    const d = cleanText(desc);
+
+    const queries = [];
+
+    // Most precise if description is available.
+    if (d) queries.push(`${p} ${d} GM`);
+    if (d) queries.push(`${p} ${d} Chevrolet`);
+    if (d) queries.push(`${p} ${d} auto part`);
+
+    // Good generic fallbacks for OEM part numbers.
+    queries.push(`${p} GM part`);
+    queries.push(`${p} Chevrolet part`);
+    queries.push(`${p} OEM GM`);
+    queries.push(`${p} auto part`);
+    queries.push(p);
+
+    // Last resort: description-only, but only if it exists.
+    if (d) queries.push(`${d} GM`);
+    if (d) queries.push(`${d} auto part`);
+
+    // Remove duplicates while preserving order.
+    return [...new Set(queries.filter(q => q && q.trim().length > 0))];
+}
+
+function extractMedianPrice(items) {
+    const validItems = items.filter(i => {
+        const value = Number(i.price?.value);
+        return Number.isFinite(value) && value > 0;
+    });
+
+    if (validItems.length === 0) {
+        return { median: null, validItems: [] };
+    }
+
+    const prices = validItems
+        .map(i => Number(i.price.value))
+        .sort((a, b) => a - b);
+
+    const median =
+        prices.length % 2 === 0
+            ? (prices[prices.length / 2 - 1] + prices[prices.length / 2]) / 2
+            : prices[Math.floor(prices.length / 2)];
+
+    return { median, validItems };
+}
+
+function chooseImage(items) {
+    for (const item of items) {
+        if (item.image?.imageUrl) {
+            return item.image.imageUrl;
+        }
+
+        if (Array.isArray(item.thumbnailImages) && item.thumbnailImages.length > 0) {
+            const thumb = item.thumbnailImages.find(t => t.imageUrl);
+            if (thumb?.imageUrl) return thumb.imageUrl;
+        }
+    }
+
+    return null;
+}
+
+// =========================
 // 🔍 EBAY SEARCH
 // =========================
 async function ebaySearch(query) {
     const token = await getToken();
+
+    console.log("🔎 EBAY QUERY:", query);
 
     const response = await retry(() =>
         axios.get(`${EBAY_BASE_URL}/buy/browse/v1/item_summary/search`, {
@@ -107,44 +192,63 @@ async function ebaySearch(query) {
             },
             params: {
                 q: query,
-                limit: 10
+                limit: 20
             },
-            timeout: 5000
+            timeout: 8000
         })
     );
 
     const data = response.data;
     const items = data.itemSummaries || [];
 
-    if (items.length === 0) return null;
+    console.log("📦 ITEMS FOUND:", items.length);
 
-    const prices = items
-        .map(i => Number(i.price?.value))
-        .filter(v => Number.isFinite(v));
+    if (items.length === 0) {
+        return null;
+    }
 
-    if (prices.length === 0) return null;
+    const { median, validItems } = extractMedianPrice(items);
 
-    prices.sort((a, b) => a - b);
+    if (median === null || validItems.length === 0) {
+        console.log("⚠️ Items found but no valid prices");
+        return null;
+    }
 
-    const median =
-        prices.length % 2 === 0
-            ? (prices[prices.length / 2 - 1] + prices[prices.length / 2]) / 2
-            : prices[Math.floor(prices.length / 2)];
-
-    const imageURL =
-        items.find(item => item.image?.imageUrl?.includes("ebayimg.com"))?.image?.imageUrl || null;
+    const first = validItems[0];
 
     return {
         price: median,
-        url: items[0]?.itemWebUrl || null,
-        imageURL
+        url: first?.itemWebUrl || null,
+        imageURL: chooseImage(validItems)
     };
+}
+
+async function searchWithQueryFallbacks(part, desc) {
+    const queries = buildQueries(part, desc);
+
+    console.log("🧭 QUERY PLAN:", queries);
+
+    for (const query of queries) {
+        const result = await ebaySearch(query);
+
+        if (result && result.price !== null && result.price > 0) {
+            console.log("✅ MATCHED QUERY:", query);
+            return result;
+        }
+    }
+
+    return null;
 }
 
 // =========================
 // 🧪 HEALTH CHECK
 // =========================
+app.get("/", (req, res) => {
+    res.send("PartGuard price engine running");
+});
+
 app.get("/ping", (req, res) => {
+    console.log("🏓 /ping hit");
     res.send("server alive");
 });
 
@@ -153,26 +257,28 @@ app.get("/ping", (req, res) => {
 // =========================
 app.get("/search", async (req, res) => {
     const startTime = Date.now();
-    const part = req.query.part;
+
+    const part = normalizePart(req.query.part);
+    const desc = cleanText(req.query.desc);
 
     console.log("\n=========================");
-    console.log("🔍 SEARCH:", part);
+    console.log("🔍 SEARCH PART:", part);
+    console.log("📝 DESC:", desc || "(none)");
 
     if (!part) {
         return res.status(400).json({ error: "Missing part" });
     }
 
-    const cached = resultCache.get(part);
+    const cacheKey = `${part}|${desc}`;
+
+    const cached = resultCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-        console.log("⚡ CACHE HIT");
+        console.log("⚡ CACHE HIT:", cacheKey);
         return res.json(cached.data);
     }
 
     try {
-        let result = await ebaySearch(`${part} GM`);
-        if (!result) {
-            result = await ebaySearch(part);
-        }
+        let result = await searchWithQueryFallbacks(part, desc);
 
         if (!result) {
             result = {
@@ -182,7 +288,7 @@ app.get("/search", async (req, res) => {
             };
         }
 
-        resultCache.set(part, {
+        resultCache.set(cacheKey, {
             data: result,
             timestamp: Date.now()
         });
@@ -190,12 +296,13 @@ app.get("/search", async (req, res) => {
         console.log("✅ RESULT:", result);
         console.log("⏱️ TIME:", Date.now() - startTime, "ms");
 
-        res.json(result);
+        return res.json(result);
+
     } catch (err) {
         const ebayMsg = err.response?.data || err.message;
         console.error("❌ ERROR:", ebayMsg);
 
-        res.json({
+        return res.json({
             price: null,
             url: null,
             imageURL: null
